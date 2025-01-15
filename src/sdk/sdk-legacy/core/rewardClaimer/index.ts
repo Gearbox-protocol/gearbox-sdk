@@ -2,11 +2,9 @@ import type { Address, PublicClient } from "viem";
 
 import type { NetworkType } from "../../../chain";
 import { MULTICALL_ADDRESS } from "../../../constants";
-import type {
-  Protocols,
-  SupportedContract,
-  SupportedToken,
-} from "../../../sdk-gov-legacy";
+import type { GearboxSDK } from "../../../GearboxSDK";
+import type { AdapterContractType } from "../../../market";
+import type { Protocols, SupportedToken } from "../../../sdk-gov-legacy";
 import type { MultiCall } from "../../../types";
 import type { PartialRecord } from "../../../utils";
 import type { TokenData } from "../../tokens/tokenData";
@@ -16,17 +14,20 @@ import { RewardConvex } from "./rewardConvex";
 import { StakingRewards } from "./stakingRewards";
 
 export interface Rewards {
-  contract: SupportedContract;
+  contract: AdapterContractType;
   protocol: Protocols.Aura | Protocols.Convex | Protocols.Sky;
+  stakedToken: Address;
 
-  rewards: PartialRecord<SupportedToken, bigint>;
+  rewards: Record<Address, bigint>;
   calls: Array<MultiCall>;
 }
 
-export interface AdapterWithType {
+export interface AdapterInfo {
   contractAddress: Address;
   adapter: Address;
-  contract: SupportedContract;
+
+  contractType: AdapterContractType;
+  name: string;
 }
 
 export class RewardClaimer {
@@ -37,8 +38,9 @@ export class RewardClaimer {
     provider: PublicClient,
     tokensList: Record<Address, TokenData>,
     currentTokenData: Record<SupportedToken, Address>,
+    sdk: GearboxSDK,
   ): Promise<Array<Rewards>> {
-    const tokens = await RewardClaimer.findRewardTokens(cm, provider);
+    const tokens = await RewardClaimer.findRewardTokens(cm, provider, sdk);
 
     const [convex, staking] = await Promise.all([
       RewardConvex.findRewards(ca, cm, currentTokenData, network, provider),
@@ -47,7 +49,8 @@ export class RewardClaimer {
         ca,
         provider,
         tokens.staking.adapters,
-        tokens.staking.tokens,
+        tokens.staking.rewardsTokens,
+        tokens.staking.stakedTokens,
         tokensList,
       ),
     ]);
@@ -57,25 +60,42 @@ export class RewardClaimer {
   static async findRewardTokens(
     cm: CreditManagerData_Legacy,
     provider: PublicClient,
+    sdk: GearboxSDK,
   ) {
-    const { calls: stakingCalls, adapters: stakingAdapters } =
-      StakingRewards.getRewardTokenCalls(cm);
+    const {
+      rewardTokenCalls,
+      tokenCalls,
+      adapters: stakingAdapters,
+    } = StakingRewards.getRewardTokenCalls(cm, sdk);
 
-    const stakingTotal = stakingCalls.flat(1);
+    const rewardCallsTotal = rewardTokenCalls.flat(1);
+    const tokenCallsTotal = tokenCalls.flat(1);
 
     const response = await provider.multicall({
       allowFailure: true,
       multicallAddress: MULTICALL_ADDRESS,
-      contracts: [...stakingTotal],
+      contracts: [...rewardCallsTotal, ...tokenCallsTotal],
     });
 
-    const stakingEnd = stakingTotal.length;
-    const stakingRewardTokensResponse = response.slice(0, stakingEnd);
+    const stakingRewardTokensEnd = rewardCallsTotal.length;
+    const stakingRewardTokensResponse = response.slice(
+      0,
+      stakingRewardTokensEnd,
+    );
+
+    const stakingTokensEnd = stakingRewardTokensEnd + tokenCallsTotal.length;
+    const stakingTokensResponse = response.slice(
+      stakingRewardTokensEnd,
+      stakingTokensEnd,
+    );
 
     return {
       staking: {
         adapters: stakingAdapters,
-        tokens: stakingRewardTokensResponse.map(
+        rewardsTokens: stakingRewardTokensResponse.map(
+          r => r?.result as Address | undefined,
+        ),
+        stakedTokens: stakingTokensResponse.map(
           r => r?.result as Address | undefined,
         ),
       },

@@ -3,23 +3,15 @@ import { encodeFunctionData } from "viem";
 
 import { iStakingRewardsAdapterAbi } from "../../../abi";
 import { ADDRESS_0X0, MULTICALL_ADDRESS } from "../../../constants";
-import type {
-  StakingRewardsParams,
-  SupportedContract,
-  SupportedToken,
-} from "../../../sdk-gov-legacy";
-import {
-  AdapterInterface,
-  contractParams,
-  contractsByAddress,
-} from "../../../sdk-gov-legacy";
+import type { GearboxSDK } from "../../../GearboxSDK";
+import type { AdapterContractType } from "../../../market";
+import { Protocols } from "../../../sdk-gov-legacy";
 import type { PartialRecord } from "../../../utils";
-import { TypedObjectUtils } from "../../../utils";
 import type { TokenData } from "../../tokens/tokenData";
 import { iBaseRewardPoolAbi } from "../../types";
 import type { CreditAccountData_Legacy } from "../creditAccount";
 import type { CreditManagerData_Legacy } from "../creditManager";
-import type { AdapterWithType, Rewards } from ".";
+import type { AdapterInfo, Rewards } from ".";
 
 type DistributionList = Array<Array<RewardDistribution>>;
 type CallsList = Array<
@@ -32,9 +24,11 @@ type CallsList = Array<
 >;
 
 export interface RewardDistribution {
-  contract: Rewards["contract"];
+  contract: AdapterContractType;
   protocol: Rewards["protocol"];
-  token: SupportedToken;
+
+  rewardToken: Address;
+  stakedToken: Address;
 
   adapter: Address;
   contractAddress: Address;
@@ -45,14 +39,17 @@ export class StakingRewards {
     ca: CreditAccountData_Legacy,
     provider: PublicClient,
 
-    adapters: Array<AdapterWithType>,
+    adapters: Array<AdapterInfo>,
     rewardTokens: Array<Address | undefined>,
+    stakedTokens: Array<Address | undefined>,
+
     tokensList: Record<Address, TokenData>,
   ): Promise<Array<Rewards>> {
     const prepared = StakingRewards.prepareMultiCalls(
       ca.creditAccount,
       adapters,
       rewardTokens,
+      stakedTokens,
       tokensList,
     );
 
@@ -78,10 +75,10 @@ export class StakingRewards {
     return results;
   }
 
-  static getRewardTokenCalls(cm: CreditManagerData_Legacy) {
-    const adapters = this.findAdapters(cm);
+  static getRewardTokenCalls(cm: CreditManagerData_Legacy, sdk: GearboxSDK) {
+    const adapters = this.findAdapters(cm, sdk);
 
-    const calls = adapters.reduce<CallsList>((acc, a) => {
+    const rewardTokenCalls = adapters.reduce<CallsList>((acc, a) => {
       acc.push([
         {
           address: a.adapter,
@@ -94,40 +91,47 @@ export class StakingRewards {
       return acc;
     }, []);
 
-    return { calls, adapters };
+    const tokenCalls = adapters.reduce<CallsList>((acc, a) => {
+      acc.push([
+        {
+          address: a.adapter,
+          abi: iStakingRewardsAdapterAbi,
+          functionName: "stakedPhantomToken",
+          args: [],
+        },
+      ]);
+
+      return acc;
+    }, []);
+
+    return { rewardTokenCalls, tokenCalls, adapters };
   }
 
-  private static findAdapters(cm: CreditManagerData_Legacy) {
-    const contractsRecord = TypedObjectUtils.entries(contractParams).reduce<
-      Record<SupportedContract, StakingRewardsParams>
-    >(
-      (acc, [token, params]) => {
-        if (params.type === AdapterInterface.STAKING_REWARDS) {
-          acc[token] = params;
-        }
-        return acc;
-      },
-      {} as Record<SupportedContract, StakingRewardsParams>,
-    );
+  private static findAdapters(cm: CreditManagerData_Legacy, sdk: GearboxSDK) {
+    const creditFactory = sdk.marketRegister.findCreditManager(cm.address);
+    const adapters = creditFactory.creditManager.adapters
+      .values()
+      .filter(adapter => {
+        const type = adapter.contractType as AdapterContractType;
+        return type === "AD_STAKING_REWARDS";
+      })
+      .map((adapter): AdapterInfo => {
+        return {
+          adapter: adapter.address.toLowerCase() as Address,
+          contractAddress: adapter.targetContract.toLowerCase() as Address,
+          contractType: adapter.contractType as AdapterContractType,
+          name: adapter.name,
+        };
+      });
 
-    return Object.entries(cm.adapters)
-      .filter(
-        ([contract]) =>
-          !!contractsRecord[contractsByAddress[contract.toLowerCase()]],
-      )
-      .map(
-        ([contract, adapter]): AdapterWithType => ({
-          adapter: adapter.address,
-          contractAddress: contract as Address,
-          contract: contractsByAddress[contract.toLowerCase()],
-        }),
-      );
+    return adapters;
   }
 
   static prepareMultiCalls(
     creditAccount: Address,
-    adapters: Array<AdapterWithType>,
+    adapters: Array<AdapterInfo>,
     rewardTokens: Array<Address | undefined>,
+    stakedTokens: Array<Address | undefined>,
     tokensList: Record<Address, TokenData>,
   ) {
     if (adapters.length === 0) return undefined;
@@ -137,18 +141,19 @@ export class StakingRewards {
       calls: CallsList;
     }>(
       (acc, a, i) => {
-        const currentContract = contractParams[
-          a.contract
-        ] as StakingRewardsParams;
         const rewardToken = rewardTokens[i]?.toLowerCase() as Address;
+        const stakedToken = stakedTokens[i]?.toLowerCase() as Address;
 
         const currentCalls: CallsList[number] = [];
         const currentDistribution: DistributionList[number] = [];
 
         if (
           rewardToken &&
+          stakedToken &&
           rewardToken !== ADDRESS_0X0 &&
-          tokensList[rewardToken]
+          stakedToken !== ADDRESS_0X0 &&
+          tokensList[rewardToken] &&
+          tokensList[stakedToken]
         ) {
           // since we generate 1 call above
           currentCalls.push({
@@ -158,9 +163,11 @@ export class StakingRewards {
             args: [creditAccount],
           });
           currentDistribution.push({
-            protocol: currentContract.protocol,
-            contract: a.contract,
-            token: tokensList[rewardToken].symbol,
+            protocol: Protocols.Sky,
+            contract: a.contractType,
+
+            rewardToken: rewardToken,
+            stakedToken: stakedToken,
 
             contractAddress: a.contractAddress,
             adapter: a.adapter,
@@ -184,7 +191,7 @@ export class StakingRewards {
     response: Array<bigint>,
     distribution: DistributionList,
   ): Array<Rewards> {
-    const rewardsRecord: PartialRecord<SupportedContract, Rewards> = {};
+    const rewardsRecord: PartialRecord<AdapterContractType, Rewards> = {};
 
     let start = 0;
     distribution.forEach(list => {
@@ -222,8 +229,10 @@ export class StakingRewards {
     const base: Rewards = {
       contract: distribution.contract,
       protocol: distribution.protocol,
+      stakedToken: distribution.stakedToken,
+
       rewards: {
-        [distribution.token]: reward,
+        [distribution.rewardToken]: reward,
       },
       calls: [
         {
