@@ -16,7 +16,7 @@ import { StakingRewards } from "./stakingRewards";
 export interface Rewards {
   contract: AdapterContractType;
   protocol: Protocols.Aura | Protocols.Convex | Protocols.Sky;
-  stakedToken: Address;
+  stakingToken: Address;
 
   rewards: Record<Address, bigint>;
   calls: Array<MultiCall>;
@@ -43,14 +43,25 @@ export class RewardClaimer {
     const tokens = await RewardClaimer.findRewardTokens(cm, provider, sdk);
 
     const [convex, staking] = await Promise.all([
-      RewardConvex.findRewards(ca, cm, currentTokenData, network, provider),
+      RewardConvex.findRewards(
+        ca,
+        cm,
+        currentTokenData,
+        network,
+        provider,
+        sdk,
+
+        tokens.convex.adapters,
+        tokens.convex.curveTokens,
+        tokens.convex.stakingTokens,
+      ),
 
       StakingRewards.findRewards(
         ca,
         provider,
         tokens.staking.adapters,
         tokens.staking.rewardsTokens,
-        tokens.staking.stakedTokens,
+        tokens.staking.stakingTokens,
         tokensList,
       ),
     ]);
@@ -64,38 +75,73 @@ export class RewardClaimer {
   ) {
     const {
       rewardTokenCalls,
-      tokenCalls,
+      tokenCalls: stakingTokenCalls_Sky,
       adapters: stakingAdapters,
     } = StakingRewards.getRewardTokenCalls(cm, sdk);
 
-    const rewardCallsTotal = rewardTokenCalls.flat(1);
-    const tokenCallsTotal = tokenCalls.flat(1);
+    const rewardCallsTotal_Sky = rewardTokenCalls.flat(1);
+    const stakingCallsTotal_Sky = stakingTokenCalls_Sky.flat(1);
+
+    const {
+      stakingTokenCalls: stakingTokenCalls_Convex,
+      curveTokenCalls,
+      adapters: convexAdapters,
+    } = RewardConvex.getRewardTokenCalls(cm, sdk);
+
+    const stakingCallsTotal_Convex = stakingTokenCalls_Convex.flat(1);
+    const curveCallsTotal_Convex = curveTokenCalls.flat(1);
 
     const response = await provider.multicall({
       allowFailure: true,
       multicallAddress: MULTICALL_ADDRESS,
-      contracts: [...rewardCallsTotal, ...tokenCallsTotal],
+      contracts: [
+        ...rewardCallsTotal_Sky,
+        ...stakingCallsTotal_Sky,
+        ...stakingCallsTotal_Convex,
+        ...curveCallsTotal_Convex,
+      ],
     });
 
-    const stakingRewardTokensEnd = rewardCallsTotal.length;
-    const stakingRewardTokensResponse = response.slice(
-      0,
-      stakingRewardTokensEnd,
+    const rewardTokensEnd_Sky = rewardCallsTotal_Sky.length;
+    const rewardTokensResponse_Sky = response.slice(0, rewardTokensEnd_Sky);
+
+    const stakingTokensEnd_Sky =
+      rewardTokensEnd_Sky + stakingCallsTotal_Sky.length;
+    const stakingTokensResponse_Sky = response.slice(
+      rewardTokensEnd_Sky,
+      stakingTokensEnd_Sky,
     );
 
-    const stakingTokensEnd = stakingRewardTokensEnd + tokenCallsTotal.length;
-    const stakingTokensResponse = response.slice(
-      stakingRewardTokensEnd,
-      stakingTokensEnd,
+    const stakingTokensEnd_Convex =
+      stakingTokensEnd_Sky + stakingCallsTotal_Convex.length;
+    const stakingTokensResponse_Convex = response.slice(
+      stakingTokensEnd_Sky,
+      stakingTokensEnd_Convex,
+    );
+
+    const curveTokenEnd_Convex =
+      stakingTokensEnd_Convex + curveCallsTotal_Convex.length;
+    const curveTokenResponse_Convex = response.slice(
+      stakingTokensEnd_Convex,
+      curveTokenEnd_Convex,
     );
 
     return {
       staking: {
         adapters: stakingAdapters,
-        rewardsTokens: stakingRewardTokensResponse.map(
+        rewardsTokens: rewardTokensResponse_Sky.map(
           r => r?.result as Address | undefined,
         ),
-        stakedTokens: stakingTokensResponse.map(
+        stakingTokens: stakingTokensResponse_Sky.map(
+          r => r?.result as Address | undefined,
+        ),
+      },
+      convex: {
+        adapters: convexAdapters,
+        curveTokens: curveTokenResponse_Convex.map(
+          r => r?.result as Address | undefined,
+        ),
+        stakingTokens: stakingTokensResponse_Convex.map(
           r => r?.result as Address | undefined,
         ),
       },

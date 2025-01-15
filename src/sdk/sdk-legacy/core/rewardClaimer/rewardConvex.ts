@@ -1,8 +1,11 @@
 import type { Abi, Address, PublicClient } from "viem";
 import { encodeFunctionData } from "viem";
 
+import { convexV1BaseRewardPoolAdapterAbi } from "../../../abi";
 import type { NetworkType } from "../../../chain";
-import { MULTICALL_ADDRESS } from "../../../constants";
+import { ADDRESS_0X0, MULTICALL_ADDRESS } from "../../../constants";
+import type { GearboxSDK } from "../../../GearboxSDK";
+import type { AdapterContractType } from "../../../market";
 import type {
   AuraPoolParams,
   ContractParams,
@@ -19,10 +22,11 @@ import {
 } from "../../../sdk-gov-legacy";
 import type { PartialRecord } from "../../../utils";
 import { TypedObjectUtils } from "../../../utils";
+import type { TokenData } from "../../tokens/tokenData";
 import { iBaseRewardPoolAbi, iConvexTokenAbi } from "../../types";
 import type { CreditAccountData_Legacy } from "../creditAccount";
 import type { CreditManagerData_Legacy } from "../creditManager";
-import type { AdapterWithType, Rewards } from ".";
+import type { AdapterInfo, Rewards } from ".";
 import { getAURAMintAmount } from "./aura";
 import { AURA_BOOSTER_ABI } from "./auraAbi";
 import { getCVXMintAmount } from "./convex";
@@ -38,9 +42,11 @@ type CallsList = Array<
 >;
 
 export interface RewardDistribution {
-  contract: Rewards["contract"];
+  contract: AdapterContractType;
   protocol: Rewards["protocol"];
-  token: SupportedToken;
+
+  rewardToken: Address;
+  stakedToken: Address;
 
   adapter: Address;
   contractAddress: Address;
@@ -60,16 +66,19 @@ interface ParseProps {
 export class RewardConvex {
   static async findRewards(
     ca: CreditAccountData_Legacy,
-    cm: CreditManagerData_Legacy,
     currentTokenData: Record<SupportedToken, Address>,
-    network: NetworkType,
     provider: PublicClient,
+
+    adapters: Array<AdapterInfo>,
+    curveTokens: Array<Address | undefined>,
+    stakedTokens: Array<Address | undefined>,
   ): Promise<Array<Rewards>> {
     const prepared = RewardConvex.prepareMultiCalls(
       ca.creditAccount,
-      cm,
+      adapters,
+      curveTokens,
+      stakedTokens,
       currentTokenData,
-      network,
     );
 
     if (!prepared) return [];
@@ -110,46 +119,69 @@ export class RewardConvex {
     return results;
   }
 
-  static findAdapters(cm: CreditManagerData_Legacy) {
-    const convexPools = TypedObjectUtils.entries(contractParams).reduce<
-      Record<SupportedContract, ContractParams>
-    >(
-      (acc, [token, params]) => {
-        if (params.type === AdapterInterface.CONVEX_V1_BASE_REWARD_POOL) {
-          acc[token] = params;
-        }
-        return acc;
-      },
-      {} as Record<SupportedContract, ContractParams>,
-    );
+  static findAdapters(cm: CreditManagerData_Legacy, sdk: GearboxSDK) {
+    const creditFactory = sdk.marketRegister.findCreditManager(cm.address);
 
-    return Object.entries(cm.adapters)
-      .filter(
-        ([contract]) =>
-          !!convexPools[contractsByAddress[contract.toLowerCase()]],
-      )
-      .map(
-        ([contract, adapter]): AdapterWithType => ({
-          adapter: adapter.address,
-          contractAddress: contract as Address,
-          contract: contractsByAddress[contract.toLowerCase()],
-        }),
-      );
+    const adapters = creditFactory.creditManager.adapters
+      .values()
+      .filter(adapter => {
+        const type = adapter.contractType as AdapterContractType;
+        return type === "AD_CONVEX_V1_BASE_REWARD_POOL";
+      })
+      .map((adapter): AdapterInfo => {
+        return {
+          adapter: adapter.address.toLowerCase() as Address,
+          contractAddress: adapter.targetContract.toLowerCase() as Address,
+          contractType: adapter.contractType as AdapterContractType,
+          name: adapter.name,
+        };
+      });
+
+    return adapters;
+  }
+
+  static getRewardTokenCalls(cm: CreditManagerData_Legacy, sdk: GearboxSDK) {
+    const adapters = this.findAdapters(cm, sdk);
+
+    const stakingTokenCalls = adapters.reduce<CallsList>((acc, a) => {
+      acc.push([
+        {
+          address: a.adapter,
+          abi: convexV1BaseRewardPoolAdapterAbi,
+          functionName: "stakedPhantomToken",
+          args: [],
+        },
+      ]);
+
+      return acc;
+    }, []);
+
+    const curveTokenCalls = adapters.reduce<CallsList>((acc, a) => {
+      acc.push([
+        {
+          address: a.adapter,
+          abi: convexV1BaseRewardPoolAdapterAbi,
+          functionName: "curveLPtoken",
+          args: [],
+        },
+      ]);
+
+      return acc;
+    }, []);
+
+    return { stakingTokenCalls, curveTokenCalls, adapters };
   }
 
   static prepareMultiCalls(
     creditAccount: Address,
-    cm: CreditManagerData_Legacy,
+    adapters: Array<AdapterInfo>,
+    curveTokens: Array<Address | undefined>,
+    stakedTokens: Array<Address | undefined>,
+
     currentTokenData: Record<SupportedToken, Address>,
-    network: NetworkType,
+    tokensList: Record<`0x${string}`, TokenData>,
   ) {
-    const contracts = contractsByNetwork[network];
-
-    const adapters = this.findAdapters(cm);
-
-    if (adapters.length === 0) {
-      return undefined;
-    }
+    if (adapters.length === 0) return undefined;
 
     const res = adapters.reduce<{
       convexDistribution: DistributionList;
@@ -158,23 +190,23 @@ export class RewardConvex {
       convexCalls: CallsList;
       auraCalls: CallsList;
     }>(
-      (acc, a) => {
-        const currentContract = contractParams[a.contract] as
-          | ConvexPoolParams
-          | AuraPoolParams;
+      (acc, a, i) => {
+        const curveToken = curveTokens[i]?.toLowerCase() as Address;
+        const stakedToken = stakedTokens[i]?.toLowerCase() as Address;
 
-        const baseRewardToken = this.getBaseRewardToken(
-          currentContract.protocol,
-        );
+        const protocol = this.getProtocol(curveToken, currentTokenData);
 
-        if (!baseRewardToken) {
-          throw new Error(
-            `Unknown rewards protocol: ${currentContract.protocol}`,
-          );
-        }
+        if (
+          !protocol ||
+          curveToken === ADDRESS_0X0 ||
+          stakedToken === ADDRESS_0X0 ||
+          !tokensList[curveToken || ""] ||
+          !tokensList[stakedToken || ""]
+        )
+          return acc;
 
         const currentCalls: CallsList[number] = [
-          ...(currentContract.protocol === Protocols.Aura
+          ...(protocol === Protocols.Aura
             ? [
                 {
                   address: contracts.AURA_BOOSTER,
@@ -194,9 +226,11 @@ export class RewardConvex {
           args: [creditAccount],
         });
         currentDistribution.push({
-          protocol: currentContract.protocol,
-          contract: a.contract,
-          token: baseRewardToken,
+          protocol: protocol,
+          contract: a.contractType,
+
+          rewardToken: curveToken,
+          stakedToken: stakedToken,
 
           contractAddress: a.contractAddress,
           adapter: a.adapter,
@@ -211,7 +245,7 @@ export class RewardConvex {
           });
 
           currentDistribution.push({
-            protocol: currentContract.protocol,
+            protocol: protocol,
             contract: a.contract,
             token: extra.rewardToken,
 
@@ -220,10 +254,10 @@ export class RewardConvex {
           });
         });
 
-        if (currentContract.protocol === Protocols.Aura) {
+        if (protocol === Protocols.Aura) {
           acc.auraCalls.push(currentCalls);
           acc.auraDistribution.push(currentDistribution);
-        } else if (currentContract.protocol === Protocols.Convex) {
+        } else if (protocol === Protocols.Convex) {
           acc.convexCalls.push(currentCalls);
           acc.convexDistribution.push(currentDistribution);
         }
@@ -428,11 +462,15 @@ export class RewardConvex {
     return undefined;
   }
 
-  static getBaseRewardToken(protocol: Protocols): SupportedToken | undefined {
-    return protocol === Protocols.Aura
-      ? "BAL"
-      : protocol === Protocols.Convex
-        ? "CRV"
+  static getProtocol(
+    convexToken: Address | undefined,
+    currentTokenData: Record<SupportedToken, Address>,
+  ): Protocols.Aura | Protocols.Convex | undefined {
+    if (!convexToken) return undefined;
+    return convexToken.toLowerCase() === currentTokenData.BAL
+      ? Protocols.Aura
+      : convexToken.toLowerCase() === currentTokenData.CRV
+        ? Protocols.Convex
         : undefined;
   }
   static getBBoostedRewardToken(
